@@ -1,0 +1,12 @@
+name = "exact-online-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+
+[[kv_namespaces]]
+binding = "TOKEN_STORE"
+id = "6f2b12c9b64c46eda80605048b8d2d86"
+preview_id = "0064f03d702246ff8fa6b1c1c8fd65b8"
+
+[vars]
+EXACT_BASE_URL = "https://start.exactonline.nl"
+# Set WORKER_URL after first deploy: wrangler secret put WORKER_URL

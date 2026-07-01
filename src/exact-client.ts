@@ -1,0 +1,273 @@
+export interface StoredTokens {
+  access_token: string;
+  refresh_token: string;
+  expires_at: number;
+}
+
+interface TrialBalanceLine {
+  GLAccountCode: string;
+  GLAccountDescription: string;
+  BalanceType: string;
+  AmountDebit: number | string;
+  AmountCredit: number | string;
+  Amount: number | string;
+}
+
+export class ExactClient {
+  private refreshPromise: Promise<string> | null = null;
+
+  constructor(
+    private kv: KVNamespace,
+    private baseUrl: string,
+    private clientId: string,
+    private clientSecret: string,
+    private workerUrl: string,
+  ) {}
+
+  private async getAccessToken(): Promise<string> {
+    const stored = await this.kv.get<StoredTokens>("tokens", "json");
+    if (!stored) {
+      throw new Error("Not authenticated. Visit /auth to connect your Exact Online account.");
+    }
+    if (Date.now() < stored.expires_at - 60_000) {
+      return stored.access_token;
+    }
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.refreshAccessToken(stored.refresh_token).finally(() => {
+        this.refreshPromise = null;
+      });
+    }
+    return this.refreshPromise;
+  }
+
+  private async refreshAccessToken(refreshToken: string): Promise<string> {
+    const res = await fetch(`${this.baseUrl}/api/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: this.clientId,
+        client_secret: this.clientSecret,
+      }),
+    });
+    if (!res.ok) {
+      // Exact rotates refresh tokens; a concurrent request in another isolate may have
+      // already used this one and stored a fresh pair. Check KV once before giving up.
+      const latest = await this.kv.get<StoredTokens>("tokens", "json");
+      if (latest && latest.refresh_token !== refreshToken && Date.now() < latest.expires_at - 60_000) {
+        return latest.access_token;
+      }
+      throw new Error(`Token refresh failed: ${await res.text()}`);
+    }
+    const tokens = await res.json() as { access_token: string; refresh_token: string; expires_in: number };
+    await this.kv.put("tokens", JSON.stringify({
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_at: Date.now() + tokens.expires_in * 1000,
+    }));
+    return tokens.access_token;
+  }
+
+  private async get<T>(path: string, params?: Record<string, string>): Promise<T> {
+    const token = await this.getAccessToken();
+    const url = new URL(`${this.baseUrl}${path}`);
+    if (params) {
+      for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+    }
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    });
+    if (!res.ok) {
+      throw new Error(`Exact Online API error ${res.status}: ${await res.text()}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  /** Fetches all pages up to a page-count guard, optionally stopping once `limit` rows are collected.
+   * Exact uses two different envelopes across endpoints: classic collections wrap rows in
+   * `d.results` with `d.__next`, while bulk/cursor-style endpoints return `d` as the row array
+   * directly with a top-level `__next`. Both are handled here since which one a given endpoint
+   * uses isn't consistent (e.g. /bulk/ paths always use the flat form). */
+  private async getAllResults<T>(path: string, params: Record<string, string>, limit?: number): Promise<T[]> {
+    const token = await this.getAccessToken();
+    const url = new URL(`${this.baseUrl}${path}`);
+    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+
+    const results: T[] = [];
+    let nextUrl: string | undefined = url.toString();
+    let pages = 0;
+    const maxPages = 20;
+
+    while (nextUrl && pages < maxPages && !(limit !== undefined && results.length >= limit)) {
+      const res = await fetch(nextUrl, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      });
+      if (!res.ok) {
+        throw new Error(`Exact Online API error ${res.status}: ${await res.text()}`);
+      }
+      const data = await res.json() as { d: T[] | { results: T[]; __next?: string }; __next?: string };
+      const pageResults = Array.isArray(data.d) ? data.d : data.d.results;
+      const next = Array.isArray(data.d) ? data.__next : data.d.__next;
+      if (!Array.isArray(pageResults)) {
+        throw new Error(`Exact Online API returned an unrecognized response shape for ${path}`);
+      }
+      results.push(...pageResults);
+      nextUrl = next;
+      pages++;
+    }
+
+    return limit !== undefined ? results.slice(0, limit) : results;
+  }
+
+  async getDivision(): Promise<number> {
+    const cached = await this.kv.get<{ id: number }>("division", "json");
+    if (cached) return cached.id;
+    const data = await this.get<{ d: { results: [{ CurrentDivision: number }] } }>("/api/v1/current/Me");
+    const division = data.d.results[0].CurrentDivision;
+    await this.kv.put("division", JSON.stringify({ id: division }));
+    return division;
+  }
+
+  async exchangeCode(code: string): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/api/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: this.clientId,
+        client_secret: this.clientSecret,
+        code,
+        redirect_uri: `${this.workerUrl}/callback`,
+      }),
+    });
+    if (!res.ok) throw new Error(`Token exchange failed: ${await res.text()}`);
+    const tokens = await res.json() as { access_token: string; refresh_token: string; expires_in: number };
+    await this.kv.put("tokens", JSON.stringify({
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_at: Date.now() + tokens.expires_in * 1000,
+    }));
+    // Pre-fetch and cache division
+    await this.kv.delete("division");
+    await this.getDivision();
+  }
+
+  async getSalesInvoices(params: { top?: number; filter?: string; orderby?: string }) {
+    const div = await this.getDivision();
+    const limit = params.top ?? 100;
+    const q: Record<string, string> = {
+      // salesentry/SalesEntries (posted ledger entries) mirrors purchaseentry/PurchaseEntries.
+      // salesinvoice/SalesInvoices is the invoice creation/draft-workflow entity and goes empty
+      // once invoices are processed/printed, so it's unreliable for reporting historical invoices.
+      "$select": "EntryNumber,EntryDate,CustomerName,AmountDC,Currency,StatusDescription,DueDate",
+      "$top": String(limit),
+      "$orderby": params.orderby ?? "EntryDate desc",
+    };
+    if (params.filter) q["$filter"] = params.filter;
+    return this.getAllResults(`/api/v1/${div}/salesentry/SalesEntries`, q, limit);
+  }
+
+  async getPurchaseInvoices(params: { top?: number; filter?: string; orderby?: string }) {
+    const div = await this.getDivision();
+    const limit = params.top ?? 100;
+    const q: Record<string, string> = {
+      "$select": "EntryNumber,EntryDate,SupplierName,AmountDC,Currency,StatusDescription,DueDate",
+      "$top": String(limit),
+      "$orderby": params.orderby ?? "EntryDate desc",
+    };
+    if (params.filter) q["$filter"] = params.filter;
+    return this.getAllResults(`/api/v1/${div}/purchaseentry/PurchaseEntries`, q, limit);
+  }
+
+  async getGLTransactions(params: { top?: number; filter?: string; financialYear?: number; period?: number }) {
+    const div = await this.getDivision();
+    const limit = params.top ?? 100;
+    const q: Record<string, string> = {
+      "$select": "GLAccountCode,GLAccountDescription,AmountDC,Date,Description,JournalDescription",
+      "$top": String(limit),
+      "$orderby": "Date desc",
+    };
+    const filters: string[] = [];
+    if (params.filter) filters.push(params.filter);
+    if (params.financialYear) filters.push(`FinancialYear eq ${params.financialYear}`);
+    if (params.period) filters.push(`FinancialPeriod eq ${params.period}`);
+    if (filters.length) q["$filter"] = filters.join(" and ");
+    return this.getAllResults(`/api/v1/${div}/bulk/Financial/TransactionLines`, q, limit);
+  }
+
+  async getGLAccounts(params: { filter?: string }) {
+    const div = await this.getDivision();
+    const q: Record<string, string> = {
+      "$select": "Code,Description,TypeDescription,BalanceSide,IsBlocked",
+      "$orderby": "Code asc",
+    };
+    if (params.filter) q["$filter"] = params.filter;
+    return this.getAllResults(`/api/v1/${div}/financial/GLAccounts`, q);
+  }
+
+  async getReceivables(params: { top?: number }) {
+    const div = await this.getDivision();
+    const limit = params.top ?? 100;
+    const q: Record<string, string> = {
+      "$select": "AccountCode,AccountName,InvoiceNumber,EntryNumber,InvoiceDate,DueDate,Amount,AmountInTransit,CurrencyCode,Description,YourRef",
+      "$orderby": "DueDate asc",
+      "$top": String(limit),
+    };
+    return this.getAllResults(`/api/v1/${div}/read/financial/ReceivablesList`, q, limit);
+  }
+
+  async getPayables(params: { top?: number }) {
+    const div = await this.getDivision();
+    const limit = params.top ?? 100;
+    const q: Record<string, string> = {
+      "$select": "AccountCode,AccountName,InvoiceNumber,EntryNumber,InvoiceDate,DueDate,Amount,AmountInTransit,CurrencyCode,YourRef,ApprovalStatus",
+      "$orderby": "DueDate asc",
+      "$top": String(limit),
+    };
+    return this.getAllResults(`/api/v1/${div}/read/financial/PayablesList`, q, limit);
+  }
+
+  async getTrialBalance(params: { financialYear?: number; period?: number; cumulative?: boolean }) {
+    const div = await this.getDivision();
+    const periods = params.cumulative && params.period
+      ? Array.from({ length: params.period }, (_, i) => i + 1)
+      : [params.period];
+
+    const rows: TrialBalanceLine[] = [];
+    for (const period of periods) {
+      const q: Record<string, string> = {
+        "$select": "GLAccountCode,GLAccountDescription,BalanceType,AmountDebit,AmountCredit,Amount",
+        "$top": "1000",
+      };
+      const filters: string[] = [];
+      if (params.financialYear) filters.push(`ReportingYear eq ${params.financialYear}`);
+      if (period) filters.push(`ReportingPeriod eq ${period}`);
+      if (filters.length) q["$filter"] = filters.join(" and ");
+      rows.push(...await this.getAllResults<TrialBalanceLine>(`/api/v1/${div}/financial/ReportingBalance`, q));
+    }
+
+    const byAccount = new Map<string, { GLAccountCode: string; GLAccountDescription: string; BalanceType: string; AmountDebit: number; AmountCredit: number; Amount: number }>();
+    for (const row of rows) {
+      const debit = Number(row.AmountDebit);
+      const credit = Number(row.AmountCredit);
+      const amount = Number(row.Amount);
+      const existing = byAccount.get(row.GLAccountCode);
+      if (existing) {
+        existing.AmountDebit += debit;
+        existing.AmountCredit += credit;
+        existing.Amount += amount;
+      } else {
+        byAccount.set(row.GLAccountCode, {
+          GLAccountCode: row.GLAccountCode,
+          GLAccountDescription: row.GLAccountDescription,
+          BalanceType: row.BalanceType,
+          AmountDebit: debit,
+          AmountCredit: credit,
+          Amount: amount,
+        });
+      }
+    }
+    return [...byAccount.values()];
+  }
+}
