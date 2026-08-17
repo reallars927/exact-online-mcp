@@ -50,6 +50,7 @@ None of these produce a true balance-sheet total (cash, equity, etc.) — balanc
 - **Field naming isn't consistent across entities.** `SalesEntries`/`PurchaseEntries` use `EntryDate`; `ReceivablesList`/`PayablesList` use `InvoiceDate`. `SalesInvoices`/`PurchaseEntries` use `Currency`; `ReceivablesList`/`PayablesList` use `CurrencyCode`. Don't assume a field name carries over between entities — check the specific entity's field list.
 - **`GLAccounts.TypeDescription` isn't fully reliable.** Some accounts are typed as `Revenue` while functioning as a cost (e.g. a payment-processor fee account netted against revenue). Don't trust `TypeDescription` alone for cost/revenue classification without spot-checking.
 - **Refresh tokens rotate.** Every refresh call invalidates the previous refresh token. `ExactClient` single-flights concurrent refreshes in-memory and the Worker reuses one client instance per isolate (see `makeClient` in `index.ts`) so concurrent requests actually share that single-flight instead of racing separate instances.
+- **Refresh tokens expire after ~30 days of disuse.** If the connector sits unused for a month, the chain dies and `/auth` must be redone manually (this took the connector down once). A daily cron trigger (`[triggers]` in `wrangler.toml` → `scheduled` in `index.ts` → `ExactClient.keepTokensFresh()`) refreshes the chain regardless of traffic. If the chain is dead anyway, the cron invocation fails visibly in the Cloudflare dashboard.
 
 ## Local development
 

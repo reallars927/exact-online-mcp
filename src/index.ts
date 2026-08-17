@@ -1,36 +1,63 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { ExactClient } from "./exact-client.js";
 import { registerTools } from "./tools.js";
+import { handleAuthorize } from "./oauth-ui.js";
 
 export interface Env {
   EXACT_CLIENT_ID: string;
   EXACT_CLIENT_SECRET: string;
   MCP_API_KEY: string;
   TOKEN_STORE: KVNamespace;
+  OAUTH_KV: KVNamespace;
   EXACT_BASE_URL: string;
   WORKER_URL: string;
+  // Injected onto env at runtime by OAuthProvider — not a real binding, so it's not in wrangler.toml.
+  OAUTH_PROVIDER: OAuthHelpers;
 }
 
+const oauthProvider = new OAuthProvider<Env>({
+  apiRoute: "/mcp",
+  apiHandler: { fetch: handleMcp },
+  defaultHandler: { fetch: handleDefault },
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+  scopesSupported: ["mcp"],
+  // resourceMetadata omitted: the library derives `resource` and `authorization_servers`
+  // from the request origin, which matches WORKER_URL for this single-deployment worker.
+});
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/auth") {
-      return initiateOAuth(env);
-    }
-
-    if (url.pathname === "/callback") {
-      return handleCallback(request, env);
-    }
-
-    if (url.pathname === "/mcp") {
-      return handleMcp(request, env);
-    }
-
-    return new Response("Not found", { status: 404 });
+  fetch: (request: Request, env: Env, ctx: ExecutionContext) =>
+    oauthProvider.fetch(request, env, ctx),
+  // Cron keep-alive (see [triggers] in wrangler.toml): refreshes the Exact token chain
+  // daily so the refresh token never hits Exact's ~30-day disuse expiry when the
+  // connector goes unused for a while. Errors propagate so a dead chain shows up as a
+  // failed cron invocation in the Cloudflare dashboard.
+  scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
+    ctx.waitUntil(makeClient(env).keepTokensFresh());
   },
 };
+
+async function handleDefault(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+
+  if (url.pathname === "/auth") {
+    return initiateOAuth(env);
+  }
+
+  if (url.pathname === "/callback") {
+    return handleCallback(request, env);
+  }
+
+  if (url.pathname === "/authorize") {
+    return handleAuthorize(request, env);
+  }
+
+  return new Response("Not found", { status: 404 });
+}
 
 function initiateOAuth(env: Env): Response {
   const params = new URLSearchParams({
@@ -65,14 +92,6 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleMcp(request: Request, env: Env): Promise<Response> {
-  const authHeader = request.headers.get("Authorization");
-  if (!authHeader || authHeader !== `Bearer ${env.MCP_API_KEY}`) {
-    return new Response("Unauthorized", {
-      status: 401,
-      headers: { "WWW-Authenticate": 'Bearer realm="exact-online-mcp"' },
-    });
-  }
-
   const client = makeClient(env);
   const server = new McpServer({ name: "exact-online-mcp", version: "1.0.0" });
   registerTools(server, client);

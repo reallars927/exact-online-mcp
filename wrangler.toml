@@ -7,6 +7,16 @@ binding = "TOKEN_STORE"
 id = "6f2b12c9b64c46eda80605048b8d2d86"
 preview_id = "0064f03d702246ff8fa6b1c1c8fd65b8"
 
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "25217c892f544e198462a809854a7dcb"
+preview_id = "143fb91c3f064a97bff1c1cf16bb20fd"
+
+# Daily token keep-alive: Exact invalidates refresh tokens after ~30 days of disuse,
+# so the scheduled handler refreshes the chain even when the connector sits unused.
+[triggers]
+crons = ["0 3 * * *"]
+
 [vars]
 EXACT_BASE_URL = "https://start.exactonline.nl"
 # Set WORKER_URL after first deploy: wrangler secret put WORKER_URL

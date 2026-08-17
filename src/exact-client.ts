@@ -69,6 +69,16 @@ export class ExactClient {
     return tokens.access_token;
   }
 
+  /** Keep-alive for the cron trigger: Exact invalidates refresh tokens after ~30 days of
+   * disuse, so the scheduled handler calls this to rotate the chain even when no tool
+   * requests come in. The access token only lives ~10 minutes, so by the time the cron
+   * fires it is always stale and `getAccessToken()` performs a real refresh (rotating the
+   * refresh token), rather than a no-op read. Throws if the chain is already dead — the
+   * failed cron invocation in the Cloudflare dashboard is the signal to redo `/auth`. */
+  async keepTokensFresh(): Promise<void> {
+    await this.getAccessToken();
+  }
+
   private async get<T>(path: string, params?: Record<string, string>): Promise<T> {
     const token = await this.getAccessToken();
     const url = new URL(`${this.baseUrl}${path}`);
