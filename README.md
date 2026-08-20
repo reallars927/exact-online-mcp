@@ -1,6 +1,12 @@
 # exact-online-mcp
 
-A Cloudflare Worker that exposes Exact Online financial data as MCP tools (used as a custom connector, e.g. in claude.ai). Most tools are read-only; the `draft_*` tools create unprocessed entries for human review in Exact, and `create_or_update_account` writes master data directly.
+A Cloudflare Worker that exposes Exact Online financial data as MCP tools (used as a custom connector, e.g. in claude.ai). It provides:
+
+- **Read tools**: `list_sales_invoices`, `list_purchase_invoices`, `list_gl_transactions`, `list_gl_accounts`, `get_receivables`, `get_payables`, `get_trial_balance`, and `query_exact` — a generic OData query over an allowlisted entity set (divisions, journals, VAT codes, customers/suppliers, aging lists, bank entries, and more).
+- **Draft tools**: `draft_general_journal_entry`, `draft_purchase_entry`, `draft_sales_entry` — entries land *unprocessed* (Status 20) in Exact for human review.
+- **Write tool**: `create_or_update_account` — customer/supplier master data, applies immediately.
+
+Every tool accepts an optional `division` parameter for multi-administration companies. See [Tools](#tools) below for endpoints and semantics.
 
 ## Setup
 
