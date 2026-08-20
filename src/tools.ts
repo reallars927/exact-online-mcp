@@ -6,6 +6,7 @@ import { ExactClient } from "./exact-client.js";
 // the keys is what enforces read-only access — only these GET paths are reachable. Keep the
 // cheatsheet terse: it ships in the tool description and costs context in every conversation.
 const QUERY_ENTITIES = {
+  "system/Divisions": "administrations (divisions) reachable with this login: Code (the number to pass as `division`),HID,Description,City,Country,Currency",
   "financial/GLAccounts": "chart of accounts: ID,Code,Description,TypeDescription,BalanceSide(D/C),IsBlocked",
   "financial/Journals": "journals (needed before booking entries): Code,Description,Type (90=general,22=purchase,20=sales,12=bank,10=cash)",
   "vat/VATCodes": "VAT codes (needed for VAT on entries): Code,Description,Percentage (fraction, e.g. 0.21),Type",
@@ -19,6 +20,7 @@ const QUERY_ENTITIES = {
   "read/financial/AgingReceivablesList": "receivables aging buckets per customer: AccountCode,AccountName,AgeGroup1..4 Amount/Description,TotalAmount,CurrencyCode",
   "read/financial/AgingPayablesList": "payables aging buckets per supplier: AccountCode,AccountName,AgeGroup1..4 Amount/Description,TotalAmount,CurrencyCode",
   "bulk/Financial/TransactionLines": "raw GL journal lines: GLAccountCode,GLAccountDescription,AmountDC,Date,Description,JournalCode,FinancialYear,FinancialPeriod",
+  "financialtransaction/BankEntries": "bank statement entries (headers; the individual lines are in bulk/Financial/TransactionLines under the bank journal): EntryNumber,JournalCode,JournalDescription,FinancialYear,FinancialPeriod,OpeningBalanceFC,ClosingBalanceFC,Status,StatusDescription",
 } as const;
 
 type QueryEntity = keyof typeof QUERY_ENTITIES;
@@ -26,6 +28,12 @@ const QUERY_ENTITY_KEYS = Object.keys(QUERY_ENTITIES) as [QueryEntity, ...QueryE
 const QUERY_CHEATSHEET = Object.entries(QUERY_ENTITIES)
   .map(([path, fields]) => `- ${path} — ${fields}`)
   .join("\n");
+
+// Every tool targets the connected account's current division by default; this shared
+// optional parameter lets multi-administration companies point a call at another one.
+const DIVISION = z.number().int().optional().describe(
+  "Division (administration) code to target instead of the default current division. Discover codes via query_exact on system/Divisions.",
+);
 
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -48,6 +56,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       top: z.number().int().min(1).max(1000).optional().describe("Max results (default: 100)"),
       filter: z.string().optional().describe("OData $filter, e.g. \"Status eq 50\" (20=open, 50=processed)"),
       orderby: z.string().optional().describe("OData $orderby, e.g. \"EntryDate desc\" (default). Field is EntryDate, not InvoiceDate."),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getSalesInvoices(args)); }
@@ -65,6 +74,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       top: z.number().int().min(1).max(1000).optional().describe("Max results (default: 100)"),
       filter: z.string().optional().describe("OData $filter expression, e.g. \"Status eq 50\""),
       orderby: z.string().optional().describe("OData $orderby expression, e.g. \"EntryDate desc\" (default)"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getPurchaseInvoices(args)); }
@@ -83,6 +93,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       financialYear: z.number().int().optional().describe("Financial year, e.g. 2024"),
       period: z.number().int().min(1).max(12).optional().describe("Financial period (month 1-12)"),
       filter: z.string().optional().describe("Additional OData $filter expression, ANDed with financialYear/period"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getGLTransactions(args)); }
@@ -98,6 +109,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       "payment-processor fees netted against revenue) are typed as Revenue despite being cost-like.",
     {
       filter: z.string().optional().describe("OData $filter, e.g. \"TypeDescription eq 'Revenue'\""),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getGLAccounts(args)); }
@@ -110,9 +122,10 @@ export function registerTools(server: McpServer, client: ExactClient): void {
     "Get outstanding receivables (openstaande debiteuren) — open sales invoices not yet paid, from " +
       "read/financial/ReceivablesList. Returns a plain array with fields: AccountCode, AccountName, " +
       "InvoiceNumber, EntryNumber, InvoiceDate, DueDate, Amount, AmountInTransit, CurrencyCode, " +
-      "Description, YourRef. Does not compute aging buckets — use DueDate against today's date for that.",
+      "Description, YourRef. For aging buckets, use query_exact on read/financial/AgingReceivablesList.",
     {
       top: z.number().int().min(1).max(500).optional().describe("Max results (default: 100)"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getReceivables(args)); }
@@ -125,10 +138,11 @@ export function registerTools(server: McpServer, client: ExactClient): void {
     "Get outstanding payables (openstaande crediteuren) — open purchase invoices not yet paid, from " +
       "read/financial/PayablesList. Returns a plain array with fields: AccountCode, AccountName, " +
       "InvoiceNumber, EntryNumber, InvoiceDate, DueDate, Amount, AmountInTransit, CurrencyCode, YourRef, " +
-      "ApprovalStatus. Amounts are signed — credit notes come through negative. Does not compute aging " +
-      "buckets — use DueDate against today's date for that.",
+      "ApprovalStatus. Amounts are signed — credit notes come through negative. For aging buckets, " +
+      "use query_exact on read/financial/AgingPayablesList.",
     {
       top: z.number().int().min(1).max(500).optional().describe("Max results (default: 100)"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getPayables(args)); }
@@ -149,6 +163,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       financialYear: z.number().int().optional().describe("Financial year, e.g. 2024"),
       period: z.number().int().min(1).max(12).optional().describe("Financial period (month 1-12)"),
       cumulative: z.boolean().optional().describe("When true (with period set), sum periods 1..period for year-to-date totals instead of just that period's movement"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.getTrialBalance(args)); }
@@ -169,6 +184,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       filter: z.string().optional().describe("OData $filter, e.g. \"FinancialYear eq 2026 and Status eq 20\""),
       orderby: z.string().optional().describe("OData $orderby, e.g. \"EntryDate desc\""),
       top: z.number().int().min(1).max(1000).optional().describe("Max results (default: 100)"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.queryEntity(args)); }
@@ -194,6 +210,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
         vatCode: z.string().optional().describe("VAT code from vat/VATCodes; Exact auto-creates the VAT lines"),
         accountCode: z.string().optional().describe("Customer/supplier code, for lines on an AR/AP account"),
       })).min(2).describe("Journal lines (at least 2, balancing to zero)"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.draftGeneralJournalEntry(args)); }
@@ -224,9 +241,41 @@ export function registerTools(server: McpServer, client: ExactClient): void {
         description: z.string().optional(),
         vatCode: z.string().optional().describe("VAT code from vat/VATCodes; VAT is auto-calculated"),
       })).min(1),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.draftPurchaseEntry(args)); }
+      catch (e) { return err(e); }
+    },
+  );
+
+  server.tool(
+    "draft_sales_entry",
+    "Book a sales invoice (verkoopboeking) as a DRAFT sales entry: it lands unprocessed (Status 20) in " +
+      "Exact for human review and processing there (unless the journal is configured to process " +
+      "immediately). Look up the sales journal code via query_exact on financial/Journals (Type 20), " +
+      "the customer via crm/Accounts, GL account codes via financial/GLAccounts, and VAT codes via " +
+      "vat/VATCodes. Line amounts are positive revenue amounts (incl. VAT when vatCode is set); for a " +
+      "credit note set creditNote true and keep amounts positive.",
+    {
+      journalCode: z.string().describe("Code of a sales journal (Type 20), from financial/Journals"),
+      customerCode: z.string().optional().describe("Customer account code (crm/Accounts). Provide this or customerName."),
+      customerName: z.string().optional().describe("Exact customer name (crm/Accounts) — must match exactly one account"),
+      entryDate: z.string().optional().describe("Invoice date, ISO format e.g. \"2026-08-20\""),
+      dueDate: z.string().optional().describe("Payment due date, ISO format"),
+      yourRef: z.string().optional().describe("Reference/invoice number visible to the customer"),
+      description: z.string().optional(),
+      creditNote: z.boolean().optional().describe("True for a sales credit note (Type 21)"),
+      lines: z.array(z.object({
+        glAccountCode: z.string().describe("Revenue GL account code, e.g. \"8000\""),
+        amount: z.number().describe("Positive revenue amount; includes VAT when vatCode is set"),
+        description: z.string().optional(),
+        vatCode: z.string().optional().describe("VAT code from vat/VATCodes; VAT is auto-calculated"),
+      })).min(1),
+      division: DIVISION,
+    },
+    async (args) => {
+      try { return ok(await client.draftSalesEntry(args)); }
       catch (e) { return err(e); }
     },
   );
@@ -250,6 +299,7 @@ export function registerTools(server: McpServer, client: ExactClient): void {
       country: z.string().optional().describe("ISO country code, e.g. \"NL\""),
       vatNumber: z.string().optional(),
       chamberOfCommerce: z.string().optional().describe("KvK number"),
+      division: DIVISION,
     },
     async (args) => {
       try { return ok(await client.createOrUpdateAccount(args)); }

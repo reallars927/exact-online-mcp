@@ -1,4 +1,4 @@
-export interface StoredTokens {
+interface StoredTokens {
   access_token: string;
   refresh_token: string;
   expires_at: number;
@@ -101,8 +101,7 @@ export class ExactClient {
 
   /** Write payloads reference GL accounts by GUID, but tools accept the human-facing
    * account code — this resolves one to the other and fails fast on 0 or >1 matches. */
-  private async resolveGLAccountId(code: string): Promise<string> {
-    const div = await this.getDivision();
+  private async resolveGLAccountId(code: string, div: number): Promise<string> {
     const rows = await this.getAllResults<{ ID: string; Code: string }>(
       `/api/v1/${div}/financial/GLAccounts`,
       { "$select": "ID,Code", "$filter": `Code eq '${this.escapeODataString(code)}'` },
@@ -116,11 +115,10 @@ export class ExactClient {
   /** Resolves a crm/Accounts row (customer/supplier) to its GUID by code or exact name.
    * Account codes are stored as fixed-length-18 numeric strings with leading spaces, so
    * code filters must left-pad — passing the bare code matches nothing. */
-  private async resolveCrmAccountId(params: { code?: string; name?: string }): Promise<string> {
+  private async resolveCrmAccountId(params: { code?: string; name?: string }, div: number): Promise<string> {
     if (!params.code && !params.name) {
       throw new Error("Provide an account code or name to resolve a customer/supplier");
     }
-    const div = await this.getDivision();
     const filter = params.code
       ? `Code eq '${this.escapeODataString(params.code.padStart(18, " "))}'`
       : `Name eq '${this.escapeODataString(params.name!)}'`;
@@ -139,8 +137,8 @@ export class ExactClient {
 
   /** Generic read access for the query_exact tool. The entity allowlist is enforced by the
    * tool's schema enum, not here — this just builds the OData query and paginates. */
-  async queryEntity(params: { entity: string; select?: string; filter?: string; orderby?: string; top?: number }) {
-    const div = await this.getDivision();
+  async queryEntity(params: { entity: string; select?: string; filter?: string; orderby?: string; top?: number; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const limit = params.top ?? 100;
     const q: Record<string, string> = { "$top": String(limit) };
     if (params.select) q["$select"] = params.select;
@@ -159,19 +157,20 @@ export class ExactClient {
   async draftGeneralJournalEntry(params: {
     journalCode: string;
     date?: string;
+    division?: number;
     lines: { glAccountCode: string; amount: number; description?: string; vatCode?: string; accountCode?: string }[];
   }) {
-    const div = await this.getDivision();
+    const div = params.division ?? await this.getDivision();
     const lines: Record<string, unknown>[] = [];
     for (const line of params.lines) {
       const l: Record<string, unknown> = {
-        GLAccount: await this.resolveGLAccountId(line.glAccountCode),
+        GLAccount: await this.resolveGLAccountId(line.glAccountCode, div),
         AmountFC: line.amount,
       };
       if (params.date) l.Date = params.date;
       if (line.description) l.Description = line.description;
       if (line.vatCode) l.VATCode = line.vatCode;
-      if (line.accountCode) l.Account = await this.resolveCrmAccountId({ code: line.accountCode });
+      if (line.accountCode) l.Account = await this.resolveCrmAccountId({ code: line.accountCode }, div);
       lines.push(l);
     }
     const created = await this.post<{ d: Record<string, unknown> }>(
@@ -203,14 +202,15 @@ export class ExactClient {
     yourRef?: string;
     description?: string;
     creditNote?: boolean;
+    division?: number;
     lines: { glAccountCode: string; amount: number; description?: string; vatCode?: string }[];
   }) {
-    const div = await this.getDivision();
-    const supplier = await this.resolveCrmAccountId({ code: params.supplierCode, name: params.supplierName });
+    const div = params.division ?? await this.getDivision();
+    const supplier = await this.resolveCrmAccountId({ code: params.supplierCode, name: params.supplierName }, div);
     const lines: Record<string, unknown>[] = [];
     for (const line of params.lines) {
       const l: Record<string, unknown> = {
-        GLAccount: await this.resolveGLAccountId(line.glAccountCode),
+        GLAccount: await this.resolveGLAccountId(line.glAccountCode, div),
         AmountFC: line.amount,
       };
       if (line.description) l.Description = line.description;
@@ -245,6 +245,62 @@ export class ExactClient {
     };
   }
 
+  /** Creates a sales entry (verkoopboeking). Line amounts are positive for revenue (incl.
+   * VAT when vatCode is set); a credit note uses Type 21 with positive line amounts as
+   * well (Exact handles the sign). Entries land unprocessed (Status 20) for review in
+   * Exact unless the journal is configured to process immediately. */
+  async draftSalesEntry(params: {
+    journalCode: string;
+    customerCode?: string;
+    customerName?: string;
+    entryDate?: string;
+    dueDate?: string;
+    yourRef?: string;
+    description?: string;
+    creditNote?: boolean;
+    division?: number;
+    lines: { glAccountCode: string; amount: number; description?: string; vatCode?: string }[];
+  }) {
+    const div = params.division ?? await this.getDivision();
+    const customer = await this.resolveCrmAccountId({ code: params.customerCode, name: params.customerName }, div);
+    const lines: Record<string, unknown>[] = [];
+    for (const line of params.lines) {
+      const l: Record<string, unknown> = {
+        GLAccount: await this.resolveGLAccountId(line.glAccountCode, div),
+        AmountFC: line.amount,
+      };
+      if (line.description) l.Description = line.description;
+      if (line.vatCode) l.VATCode = line.vatCode;
+      lines.push(l);
+    }
+    const header: Record<string, unknown> = {
+      Journal: params.journalCode,
+      Customer: customer,
+      Type: params.creditNote ? 21 : 20,
+      SalesEntryLines: lines,
+    };
+    if (params.entryDate) header.EntryDate = params.entryDate;
+    if (params.dueDate) header.DueDate = params.dueDate;
+    if (params.yourRef) header.YourRef = params.yourRef;
+    if (params.description) header.Description = params.description;
+    const created = await this.post<{ d: Record<string, unknown> }>(
+      `/api/v1/${div}/salesentry/SalesEntries`,
+      header,
+    );
+    const d = created.d;
+    return {
+      EntryID: d.EntryID,
+      EntryNumber: d.EntryNumber,
+      CustomerName: d.CustomerName,
+      EntryDate: d.EntryDate,
+      DueDate: d.DueDate,
+      AmountFC: d.AmountFC,
+      VATAmountFC: d.VATAmountFC,
+      Status: d.Status,
+      StatusDescription: d.StatusDescription,
+    };
+  }
+
   /** Creates (POST) or updates (PUT, when id is given) a customer/supplier master-data
    * record in crm/Accounts. Unlike the entry tools there is no draft state — changes
    * apply immediately. Only provided fields are sent, so updates are partial. */
@@ -261,8 +317,9 @@ export class ExactClient {
     country?: string;
     vatNumber?: string;
     chamberOfCommerce?: string;
+    division?: number;
   }) {
-    const div = await this.getDivision();
+    const div = params.division ?? await this.getDivision();
     const body: Record<string, unknown> = {};
     if (params.name !== undefined) body.Name = params.name;
     if (params.isSupplier !== undefined) body.IsSupplier = params.isSupplier;
@@ -383,8 +440,8 @@ export class ExactClient {
     await this.getDivision();
   }
 
-  async getSalesInvoices(params: { top?: number; filter?: string; orderby?: string }) {
-    const div = await this.getDivision();
+  async getSalesInvoices(params: { top?: number; filter?: string; orderby?: string; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const limit = params.top ?? 100;
     const q: Record<string, string> = {
       // salesentry/SalesEntries (posted ledger entries) mirrors purchaseentry/PurchaseEntries.
@@ -398,8 +455,8 @@ export class ExactClient {
     return this.getAllResults(`/api/v1/${div}/salesentry/SalesEntries`, q, limit);
   }
 
-  async getPurchaseInvoices(params: { top?: number; filter?: string; orderby?: string }) {
-    const div = await this.getDivision();
+  async getPurchaseInvoices(params: { top?: number; filter?: string; orderby?: string; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const limit = params.top ?? 100;
     const q: Record<string, string> = {
       "$select": "EntryNumber,EntryDate,SupplierName,AmountDC,Currency,StatusDescription,DueDate",
@@ -410,8 +467,8 @@ export class ExactClient {
     return this.getAllResults(`/api/v1/${div}/purchaseentry/PurchaseEntries`, q, limit);
   }
 
-  async getGLTransactions(params: { top?: number; filter?: string; financialYear?: number; period?: number }) {
-    const div = await this.getDivision();
+  async getGLTransactions(params: { top?: number; filter?: string; financialYear?: number; period?: number; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const limit = params.top ?? 100;
     const q: Record<string, string> = {
       "$select": "GLAccountCode,GLAccountDescription,AmountDC,Date,Description,JournalDescription",
@@ -426,8 +483,8 @@ export class ExactClient {
     return this.getAllResults(`/api/v1/${div}/bulk/Financial/TransactionLines`, q, limit);
   }
 
-  async getGLAccounts(params: { filter?: string }) {
-    const div = await this.getDivision();
+  async getGLAccounts(params: { filter?: string; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const q: Record<string, string> = {
       "$select": "Code,Description,TypeDescription,BalanceSide,IsBlocked",
       "$orderby": "Code asc",
@@ -436,8 +493,8 @@ export class ExactClient {
     return this.getAllResults(`/api/v1/${div}/financial/GLAccounts`, q);
   }
 
-  async getReceivables(params: { top?: number }) {
-    const div = await this.getDivision();
+  async getReceivables(params: { top?: number; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const limit = params.top ?? 100;
     const q: Record<string, string> = {
       "$select": "AccountCode,AccountName,InvoiceNumber,EntryNumber,InvoiceDate,DueDate,Amount,AmountInTransit,CurrencyCode,Description,YourRef",
@@ -447,8 +504,8 @@ export class ExactClient {
     return this.getAllResults(`/api/v1/${div}/read/financial/ReceivablesList`, q, limit);
   }
 
-  async getPayables(params: { top?: number }) {
-    const div = await this.getDivision();
+  async getPayables(params: { top?: number; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const limit = params.top ?? 100;
     const q: Record<string, string> = {
       "$select": "AccountCode,AccountName,InvoiceNumber,EntryNumber,InvoiceDate,DueDate,Amount,AmountInTransit,CurrencyCode,YourRef,ApprovalStatus",
@@ -458,8 +515,8 @@ export class ExactClient {
     return this.getAllResults(`/api/v1/${div}/read/financial/PayablesList`, q, limit);
   }
 
-  async getTrialBalance(params: { financialYear?: number; period?: number; cumulative?: boolean }) {
-    const div = await this.getDivision();
+  async getTrialBalance(params: { financialYear?: number; period?: number; cumulative?: boolean; division?: number }) {
+    const div = params.division ?? await this.getDivision();
     const periods = params.cumulative && params.period
       ? Array.from({ length: params.period }, (_, i) => i + 1)
       : [params.period];

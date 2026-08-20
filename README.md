@@ -6,7 +6,7 @@ A Cloudflare Worker that exposes Exact Online financial data as MCP tools (used 
 
 You need a Cloudflare account (the free Workers tier suffices) and an Exact Online subscription.
 
-1. **Register an app with Exact** in the [Exact App Center](https://apps.exactonline.com) (My apps → register a new app). Set the redirect URI to `https://<your-worker-url>/callback` — you can come back and fill this in after step 3 once you know the URL. Note the client ID and client secret.
+1. **Register an app in Exact Online** under Import/Export → App-registraties (app registrations). Set the redirect URI to `https://<your-worker-url>/callback` — you can come back and fill this in after step 3 once you know the URL. Note the client ID and client secret.
 2. **Create your own KV namespaces** and replace the `id`/`preview_id` values in `wrangler.toml` with the ones the commands print:
    ```
    npx wrangler kv namespace create TOKEN_STORE
@@ -61,15 +61,18 @@ All list tools return a **plain JSON array** of row objects — the OData envelo
 | `list_purchase_invoices` | `purchaseentry/PurchaseEntries` | Posted purchase ledger entries. Signed amounts (credit notes negative). |
 | `list_gl_transactions` | `bulk/Financial/TransactionLines` | Raw journal lines, not aggregated per account. |
 | `list_gl_accounts` | `financial/GLAccounts` | Chart of accounts. |
-| `get_receivables` | `read/financial/ReceivablesList` | Open sales invoices. No computed aging buckets — bucket by `DueDate` yourself. |
-| `get_payables` | `read/financial/PayablesList` | Open purchase invoices. Signed amounts. No computed aging buckets. |
+| `get_receivables` | `read/financial/ReceivablesList` | Open sales invoices. For aging buckets, use `query_exact` on `read/financial/AgingReceivablesList`. |
+| `get_payables` | `read/financial/PayablesList` | Open purchase invoices. Signed amounts. For aging buckets, use `query_exact` on `read/financial/AgingPayablesList`. |
 | `get_trial_balance` | `financial/ReportingBalance` | Aggregated per GL account client-side (see below). |
 | `query_exact` | allowlisted GET paths | Generic read-only OData query. The allowlist is the `entity` enum in `tools.ts` (`QUERY_ENTITIES`) — extend it there, keeping the cheatsheet terse. |
 | `draft_general_journal_entry` | `generaljournalentry/GeneralJournalEntries` (POST) | Creates an **unprocessed** (Status 20) memoriaal entry for review in Exact. Accepts GL account codes; GUIDs resolved internally. |
 | `draft_purchase_entry` | `purchaseentry/PurchaseEntries` (POST) | Creates an **unprocessed** (Status 20) purchase entry. Supplier by code or exact name; GUIDs resolved internally. |
+| `draft_sales_entry` | `salesentry/SalesEntries` (POST) | Creates an **unprocessed** (Status 20) sales entry, mirroring `draft_purchase_entry` (Type 20, credit note 21). |
 | `create_or_update_account` | `crm/Accounts` (POST/PUT) | Master data — **no draft state, applies immediately**; named `create_`/`update_` (not `draft_`) on purpose so the draft-implies-safe signal stays honest. |
 
 Full field lists and filter/orderby guidance are in each tool's description in `src/tools.ts` — keep those in sync with `exact-client.ts`'s `$select` clauses when either changes.
+
+Every tool targets the connected account's *current* division (administration) by default — resolved once via `/api/v1/current/Me` and cached in KV. Multi-administration companies can pass the optional `division` parameter (any tool) to target another one; the codes come from `query_exact` on `system/Divisions`.
 
 ### `get_trial_balance` semantics
 
