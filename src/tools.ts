@@ -6,7 +6,7 @@ import { ExactClient } from "./exact-client.js";
 // the keys is what enforces read-only access — only these GET paths are reachable. Keep the
 // cheatsheet terse: it ships in the tool description and costs context in every conversation.
 const QUERY_ENTITIES = {
-  "system/Divisions": "administrations (divisions) reachable with this login: Code (the number to pass as `division`),HID,Description,City,Country,Currency",
+  "system/Divisions": "administrations (divisions) reachable with this login: Code (the number to pass as `division`),Description,City,Country,Currency",
   "financial/GLAccounts": "chart of accounts: ID,Code,Description,TypeDescription,BalanceSide(D/C),IsBlocked",
   "financial/Journals": "journals (needed before booking entries): Code,Description,Type (90=general,22=purchase,20=sales,12=bank,10=cash)",
   "vat/VATCodes": "VAT codes (needed for VAT on entries): Code,Description,Percentage (fraction, e.g. 0.21),Type",
@@ -31,7 +31,7 @@ const QUERY_CHEATSHEET = Object.entries(QUERY_ENTITIES)
 
 // Every tool targets the connected account's current division by default; this shared
 // optional parameter lets multi-administration companies point a call at another one.
-const DIVISION = z.number().int().optional().describe(
+const DIVISION = z.coerce.number().int().optional().describe(
   "Division (administration) code to target instead of the default current division. Discover codes via query_exact on system/Divisions.",
 );
 

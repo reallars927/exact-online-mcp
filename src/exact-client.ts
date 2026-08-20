@@ -29,7 +29,10 @@ export class ExactClient {
     if (!stored) {
       throw new Error("Not authenticated. Visit /auth to connect your Exact Online account.");
     }
-    if (Date.now() < stored.expires_at - 60_000) {
+    // Exact's token endpoint only permits a refresh in the final ~30 seconds of the access
+    // token's life — refreshing earlier is rejected with "Rate limit exceeded: access_token
+    // not expired" — so the refresh buffer must not exceed that window.
+    if (Date.now() < stored.expires_at - 30_000) {
       return stored.access_token;
     }
     if (!this.refreshPromise) {
@@ -52,10 +55,13 @@ export class ExactClient {
       }),
     });
     if (!res.ok) {
-      // Exact rotates refresh tokens; a concurrent request in another isolate may have
-      // already used this one and stored a fresh pair. Check KV once before giving up.
+      // Two benign races end up here: a concurrent request in another isolate already used
+      // this refresh token and stored a fresh pair (Exact rotates them), or Exact's token
+      // endpoint rejected a refresh attempted while the current access token is still valid
+      // ("Rate limit exceeded: access_token not expired"). In both cases the stored access
+      // token still works — re-read KV once before giving up.
       const latest = await this.kv.get<StoredTokens>("tokens", "json");
-      if (latest && latest.refresh_token !== refreshToken && Date.now() < latest.expires_at - 60_000) {
+      if (latest && Date.now() < latest.expires_at) {
         return latest.access_token;
       }
       throw new Error(`Token refresh failed: ${await res.text()}`);
