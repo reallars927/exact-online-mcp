@@ -5,6 +5,18 @@ interface AuthorizeEnv {
   MCP_API_KEY: string;
 }
 
+/** Constant-time passphrase check: comparing SHA-256 digests guarantees equal-length
+ * inputs for `timingSafeEqual` (a Cloudflare Workers extension) and leaks neither
+ * content nor length of the expected passphrase through timing. */
+async function passphraseMatches(passphrase: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(passphrase)),
+    crypto.subtle.digest("SHA-256", enc.encode(expected)),
+  ]);
+  return crypto.subtle.timingSafeEqual(a, b);
+}
+
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
@@ -46,7 +58,7 @@ export async function handleAuthorize(request: Request, env: AuthorizeEnv): Prom
     }
     const reqInfo = JSON.parse(atob(encodedReq)) as AuthRequest;
 
-    if (passphrase !== env.MCP_API_KEY) {
+    if (!(await passphraseMatches(passphrase, env.MCP_API_KEY))) {
       const client = await env.OAUTH_PROVIDER.lookupClient(reqInfo.clientId);
       return renderForm(reqInfo, client, "Incorrect passphrase.");
     }

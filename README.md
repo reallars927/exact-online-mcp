@@ -1,19 +1,30 @@
 # exact-online-mcp
 
-A Cloudflare Worker that exposes read-only Exact Online financial data as MCP tools (used as a custom connector, e.g. in claude.ai).
+A Cloudflare Worker that exposes Exact Online financial data as MCP tools (used as a custom connector, e.g. in claude.ai). Most tools are read-only; the `draft_*` tools create unprocessed entries for human review in Exact, and `create_or_update_account` writes master data directly.
 
 ## Architecture
 
-- `src/index.ts` — HTTP routing (`/auth`, `/callback`, `/mcp`), OAuth token exchange, and the `MCP_API_KEY` bearer-auth gate on `/mcp`.
+- `src/index.ts` — HTTP routing (`/auth`, `/callback`, `/mcp`), the Exact OAuth token exchange, and the `@cloudflare/workers-oauth-provider` wrapper that gates `/mcp`.
+- `src/oauth-ui.ts` — the `/authorize` passphrase form for the MCP-client OAuth flow.
 - `src/exact-client.ts` — Exact Online API client: token refresh, pagination, and one method per tool.
 - `src/tools.ts` — MCP tool definitions (schema + description) that wrap the client methods.
-- Tokens and the cached division ID are stored in the `TOKEN_STORE` KV namespace.
+- Exact tokens and the cached division ID live in the `TOKEN_STORE` KV namespace; the OAuth provider's client registrations and grants live in `OAUTH_KV`.
 
-### Auth flow
+### Auth flows
+
+There are two separate OAuth flows: the worker is an OAuth *client* towards Exact and an OAuth *server* towards MCP clients.
+
+**Worker ↔ Exact** (done once, by the owner):
 
 1. Visit `/auth` → redirects to Exact's OAuth consent screen.
-2. Exact redirects back to `/callback?code=...` → the worker exchanges the code for tokens, stores them in KV, and caches the current division.
-3. `/mcp` requires `Authorization: Bearer <MCP_API_KEY>` and serves the MCP tools using the stored Exact tokens (auto-refreshed as needed).
+2. Exact redirects back to `/callback?code=...` → the worker exchanges the code for tokens, stores them in `TOKEN_STORE`, and caches the current division.
+3. Tokens are auto-refreshed on use, and a daily cron keep-alive stops the refresh token from hitting Exact's ~30-day disuse expiry.
+
+**MCP client ↔ worker** (e.g. adding the connector in claude.ai):
+
+1. The MCP client discovers the OAuth metadata and registers itself at `/register` (dynamic client registration).
+2. Its OAuth flow lands on `/authorize`, which shows a passphrase form; entering the passphrase (the `MCP_API_KEY` secret) approves the grant.
+3. The client redeems the code at `/token` and calls `/mcp` with the resulting bearer token, which `workers-oauth-provider` validates before the MCP tools run.
 
 ### Response shape
 
@@ -30,6 +41,10 @@ All list tools return a **plain JSON array** of row objects — the OData envelo
 | `get_receivables` | `read/financial/ReceivablesList` | Open sales invoices. No computed aging buckets — bucket by `DueDate` yourself. |
 | `get_payables` | `read/financial/PayablesList` | Open purchase invoices. Signed amounts. No computed aging buckets. |
 | `get_trial_balance` | `financial/ReportingBalance` | Aggregated per GL account client-side (see below). |
+| `query_exact` | allowlisted GET paths | Generic read-only OData query. The allowlist is the `entity` enum in `tools.ts` (`QUERY_ENTITIES`) — extend it there, keeping the cheatsheet terse. |
+| `draft_general_journal_entry` | `generaljournalentry/GeneralJournalEntries` (POST) | Creates an **unprocessed** (Status 20) memoriaal entry for review in Exact. Accepts GL account codes; GUIDs resolved internally. |
+| `draft_purchase_entry` | `purchaseentry/PurchaseEntries` (POST) | Creates an **unprocessed** (Status 20) purchase entry. Supplier by code or exact name; GUIDs resolved internally. |
+| `create_or_update_account` | `crm/Accounts` (POST/PUT) | Master data — **no draft state, applies immediately**; named `create_`/`update_` (not `draft_`) on purpose so the draft-implies-safe signal stays honest. |
 
 Full field lists and filter/orderby guidance are in each tool's description in `src/tools.ts` — keep those in sync with `exact-client.ts`'s `$select` clauses when either changes.
 
