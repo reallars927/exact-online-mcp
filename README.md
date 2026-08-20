@@ -2,6 +2,29 @@
 
 A Cloudflare Worker that exposes Exact Online financial data as MCP tools (used as a custom connector, e.g. in claude.ai). Most tools are read-only; the `draft_*` tools create unprocessed entries for human review in Exact, and `create_or_update_account` writes master data directly.
 
+## Setup
+
+You need a Cloudflare account (the free Workers tier suffices) and an Exact Online subscription.
+
+1. **Register an app with Exact** in the [Exact App Center](https://apps.exactonline.com) (My apps → register a new app). Set the redirect URI to `https://<your-worker-url>/callback` — you can come back and fill this in after step 3 once you know the URL. Note the client ID and client secret.
+2. **Create your own KV namespaces** and replace the `id`/`preview_id` values in `wrangler.toml` with the ones the commands print:
+   ```
+   npx wrangler kv namespace create TOKEN_STORE
+   npx wrangler kv namespace create OAUTH_KV
+   ```
+3. **Deploy**: `npm install && npm run deploy`. Note the `*.workers.dev` URL wrangler prints. If your Exact country is not the Netherlands, first change `EXACT_BASE_URL` in `wrangler.toml` (e.g. `https://start.exactonline.be`).
+4. **Set the secrets**:
+   ```
+   npx wrangler secret put EXACT_CLIENT_ID
+   npx wrangler secret put EXACT_CLIENT_SECRET
+   npx wrangler secret put MCP_API_KEY   # a passphrase you choose; it gates connector access in step 6
+   npx wrangler secret put WORKER_URL    # the deployed URL, e.g. https://exact-online-mcp.<account>.workers.dev
+   ```
+5. **Connect Exact**: visit `https://<your-worker-url>/auth` in a browser and approve on Exact's consent screen. You should land on "Connected to Exact Online."
+6. **Add the connector**: in claude.ai → Settings → Connectors → Add custom connector, with URL `https://<your-worker-url>/mcp`. The OAuth flow opens the worker's authorize page; enter the `MCP_API_KEY` passphrase to approve.
+
+Anyone with the worker URL can *attempt* the connector flow, but without the passphrase they get no access to your data; the `/auth` Exact connection is tied to whichever Exact account approves the consent screen.
+
 ## Architecture
 
 - `src/index.ts` — HTTP routing (`/auth`, `/callback`, `/mcp`), the Exact OAuth token exchange, and the `@cloudflare/workers-oauth-provider` wrapper that gates `/mcp`.

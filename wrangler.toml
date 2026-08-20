@@ -2,6 +2,9 @@ name = "exact-online-mcp"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
 
+# Replace both namespace ids below with your own (see "Setup" in the README):
+#   npx wrangler kv namespace create TOKEN_STORE
+#   npx wrangler kv namespace create OAUTH_KV
 [[kv_namespaces]]
 binding = "TOKEN_STORE"
 id = "6f2b12c9b64c46eda80605048b8d2d86"
