@@ -69,6 +69,226 @@ export class ExactClient {
     return tokens.access_token;
   }
 
+  private async post<T>(path: string, body: unknown): Promise<T> {
+    const token = await this.getAccessToken();
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`Exact Online API error ${res.status}: ${await res.text()}`);
+    }
+    return res.json() as Promise<T>;
+  }
+
+  /** PUT in Exact's OData API returns 204 No Content on success. */
+  private async put(path: string, body: unknown): Promise<void> {
+    const token = await this.getAccessToken();
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`Exact Online API error ${res.status}: ${await res.text()}`);
+    }
+  }
+
+  private escapeODataString(value: string): string {
+    return value.replace(/'/g, "''");
+  }
+
+  /** Write payloads reference GL accounts by GUID, but tools accept the human-facing
+   * account code — this resolves one to the other and fails fast on 0 or >1 matches. */
+  private async resolveGLAccountId(code: string): Promise<string> {
+    const div = await this.getDivision();
+    const rows = await this.getAllResults<{ ID: string; Code: string }>(
+      `/api/v1/${div}/financial/GLAccounts`,
+      { "$select": "ID,Code", "$filter": `Code eq '${this.escapeODataString(code)}'` },
+    );
+    if (rows.length !== 1) {
+      throw new Error(`GL account code '${code}' matched ${rows.length} accounts; expected exactly 1`);
+    }
+    return rows[0].ID;
+  }
+
+  /** Resolves a crm/Accounts row (customer/supplier) to its GUID by code or exact name.
+   * Account codes are stored as fixed-length-18 numeric strings with leading spaces, so
+   * code filters must left-pad — passing the bare code matches nothing. */
+  private async resolveCrmAccountId(params: { code?: string; name?: string }): Promise<string> {
+    if (!params.code && !params.name) {
+      throw new Error("Provide an account code or name to resolve a customer/supplier");
+    }
+    const div = await this.getDivision();
+    const filter = params.code
+      ? `Code eq '${this.escapeODataString(params.code.padStart(18, " "))}'`
+      : `Name eq '${this.escapeODataString(params.name!)}'`;
+    const rows = await this.getAllResults<{ ID: string; Code: string; Name: string }>(
+      `/api/v1/${div}/crm/Accounts`,
+      { "$select": "ID,Code,Name", "$filter": filter },
+    );
+    if (rows.length !== 1) {
+      const matches = rows.map((r) => `${r.Code.trim()} ${r.Name}`).join(", ");
+      throw new Error(
+        `Account ${params.code ?? params.name} matched ${rows.length} accounts${matches ? ` (${matches})` : ""}; expected exactly 1`,
+      );
+    }
+    return rows[0].ID;
+  }
+
+  /** Generic read access for the query_exact tool. The entity allowlist is enforced by the
+   * tool's schema enum, not here — this just builds the OData query and paginates. */
+  async queryEntity(params: { entity: string; select?: string; filter?: string; orderby?: string; top?: number }) {
+    const div = await this.getDivision();
+    const limit = params.top ?? 100;
+    const q: Record<string, string> = { "$top": String(limit) };
+    if (params.select) q["$select"] = params.select;
+    if (params.filter) q["$filter"] = params.filter;
+    if (params.orderby) q["$orderby"] = params.orderby;
+    const rows = await this.getAllResults<Record<string, unknown>>(`/api/v1/${div}/${params.entity}`, q, limit);
+    // Strip the OData __metadata block from each row — it's per-row URI/type noise that
+    // would otherwise dominate the tool output the model has to read.
+    return rows.map(({ __metadata, ...rest }) => rest);
+  }
+
+  /** Creates a general journal entry (memoriaal). Lines must balance to zero (before any
+   * VAT lines Exact auto-generates from vatCode); Exact validates and rejects otherwise.
+   * Entries land unprocessed (Status 20) for review in Exact unless the journal is
+   * configured to process immediately. */
+  async draftGeneralJournalEntry(params: {
+    journalCode: string;
+    date?: string;
+    lines: { glAccountCode: string; amount: number; description?: string; vatCode?: string; accountCode?: string }[];
+  }) {
+    const div = await this.getDivision();
+    const lines: Record<string, unknown>[] = [];
+    for (const line of params.lines) {
+      const l: Record<string, unknown> = {
+        GLAccount: await this.resolveGLAccountId(line.glAccountCode),
+        AmountFC: line.amount,
+      };
+      if (params.date) l.Date = params.date;
+      if (line.description) l.Description = line.description;
+      if (line.vatCode) l.VATCode = line.vatCode;
+      if (line.accountCode) l.Account = await this.resolveCrmAccountId({ code: line.accountCode });
+      lines.push(l);
+    }
+    const created = await this.post<{ d: Record<string, unknown> }>(
+      `/api/v1/${div}/generaljournalentry/GeneralJournalEntries`,
+      { JournalCode: params.journalCode, GeneralJournalEntryLines: lines },
+    );
+    const d = created.d;
+    return {
+      EntryID: d.EntryID,
+      EntryNumber: d.EntryNumber,
+      JournalCode: d.JournalCode,
+      FinancialYear: d.FinancialYear,
+      FinancialPeriod: d.FinancialPeriod,
+      Status: d.Status,
+      StatusDescription: d.StatusDescription,
+    };
+  }
+
+  /** Creates a purchase entry (inkoopboeking). Line amounts are positive for costs; a
+   * credit note uses Type 31 with positive line amounts as well (Exact handles the sign).
+   * Entries land unprocessed (Status 20) for review in Exact unless the journal is
+   * configured to process immediately. */
+  async draftPurchaseEntry(params: {
+    journalCode: string;
+    supplierCode?: string;
+    supplierName?: string;
+    entryDate?: string;
+    dueDate?: string;
+    yourRef?: string;
+    description?: string;
+    creditNote?: boolean;
+    lines: { glAccountCode: string; amount: number; description?: string; vatCode?: string }[];
+  }) {
+    const div = await this.getDivision();
+    const supplier = await this.resolveCrmAccountId({ code: params.supplierCode, name: params.supplierName });
+    const lines: Record<string, unknown>[] = [];
+    for (const line of params.lines) {
+      const l: Record<string, unknown> = {
+        GLAccount: await this.resolveGLAccountId(line.glAccountCode),
+        AmountFC: line.amount,
+      };
+      if (line.description) l.Description = line.description;
+      if (line.vatCode) l.VATCode = line.vatCode;
+      lines.push(l);
+    }
+    const header: Record<string, unknown> = {
+      Journal: params.journalCode,
+      Supplier: supplier,
+      Type: params.creditNote ? 31 : 30,
+      PurchaseEntryLines: lines,
+    };
+    if (params.entryDate) header.EntryDate = params.entryDate;
+    if (params.dueDate) header.DueDate = params.dueDate;
+    if (params.yourRef) header.YourRef = params.yourRef;
+    if (params.description) header.Description = params.description;
+    const created = await this.post<{ d: Record<string, unknown> }>(
+      `/api/v1/${div}/purchaseentry/PurchaseEntries`,
+      header,
+    );
+    const d = created.d;
+    return {
+      EntryID: d.EntryID,
+      EntryNumber: d.EntryNumber,
+      SupplierName: d.SupplierName,
+      EntryDate: d.EntryDate,
+      DueDate: d.DueDate,
+      AmountFC: d.AmountFC,
+      VATAmountFC: d.VATAmountFC,
+      Status: d.Status,
+      StatusDescription: d.StatusDescription,
+    };
+  }
+
+  /** Creates (POST) or updates (PUT, when id is given) a customer/supplier master-data
+   * record in crm/Accounts. Unlike the entry tools there is no draft state — changes
+   * apply immediately. Only provided fields are sent, so updates are partial. */
+  async createOrUpdateAccount(params: {
+    id?: string;
+    name?: string;
+    isSupplier?: boolean;
+    isCustomer?: boolean;
+    email?: string;
+    phone?: string;
+    addressLine1?: string;
+    postcode?: string;
+    city?: string;
+    country?: string;
+    vatNumber?: string;
+    chamberOfCommerce?: string;
+  }) {
+    const div = await this.getDivision();
+    const body: Record<string, unknown> = {};
+    if (params.name !== undefined) body.Name = params.name;
+    if (params.isSupplier !== undefined) body.IsSupplier = params.isSupplier;
+    // Status "C" marks the account as a customer; "A" (none) removes that classification.
+    if (params.isCustomer !== undefined) body.Status = params.isCustomer ? "C" : "A";
+    if (params.email !== undefined) body.Email = params.email;
+    if (params.phone !== undefined) body.Phone = params.phone;
+    if (params.addressLine1 !== undefined) body.AddressLine1 = params.addressLine1;
+    if (params.postcode !== undefined) body.Postcode = params.postcode;
+    if (params.city !== undefined) body.City = params.city;
+    if (params.country !== undefined) body.Country = params.country;
+    if (params.vatNumber !== undefined) body.VATNumber = params.vatNumber;
+    if (params.chamberOfCommerce !== undefined) body.ChamberOfCommerce = params.chamberOfCommerce;
+
+    if (params.id) {
+      await this.put(`/api/v1/${div}/crm/Accounts(guid'${params.id}')`, body);
+      return { updated: params.id };
+    }
+    if (!params.name) {
+      throw new Error("Creating an account requires a name");
+    }
+    const created = await this.post<{ d: Record<string, unknown> }>(`/api/v1/${div}/crm/Accounts`, body);
+    const d = created.d;
+    return { ID: d.ID, Code: typeof d.Code === "string" ? d.Code.trim() : d.Code, Name: d.Name };
+  }
+
   /** Keep-alive for the cron trigger: Exact invalidates refresh tokens after ~30 days of
    * disuse, so the scheduled handler calls this to rotate the chain even when no tool
    * requests come in. The access token only lives ~10 minutes, so by the time the cron
