@@ -3,7 +3,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { OAuthProvider, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { ExactClient } from "./exact-client.js";
 import { registerTools } from "./tools.js";
-import { handleAuthorize } from "./oauth-ui.js";
+import { handleAuthorize, passphraseMatches } from "./oauth-ui.js";
 
 export interface Env {
   EXACT_CLIENT_ID: string;
@@ -45,7 +45,7 @@ async function handleDefault(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
 
   if (url.pathname === "/auth") {
-    return initiateOAuth(env);
+    return handleAuth(request, env);
   }
 
   if (url.pathname === "/callback") {
@@ -59,12 +59,51 @@ async function handleDefault(request: Request, env: Env): Promise<Response> {
   return new Response("Not found", { status: 404 });
 }
 
-function initiateOAuth(env: Env): Response {
+function renderAuthGate(error?: string): Response {
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Connect Exact Online</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 420px; margin: 4rem auto;">
+  <h2>Connect Exact Online</h2>
+  <p>Enter the passphrase to start the Exact Online connection flow.</p>
+  ${error ? `<p style="color: #b00020;">${error}</p>` : ""}
+  <form method="POST">
+    <label for="passphrase">Passphrase</label><br>
+    <input type="password" id="passphrase" name="passphrase" autofocus style="width: 100%; padding: 0.5rem; margin: 0.5rem 0;">
+    <button type="submit" style="padding: 0.5rem 1rem;">Continue</button>
+  </form>
+</body>
+</html>`;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+/** Gates the Exact connection flow behind the owner passphrase and binds it to a
+ * single-use `state` nonce checked in /callback. Without both, anyone knowing the
+ * worker URL could complete the flow with their own Exact account and overwrite the
+ * stored token pair — silently rebinding the connector to a stranger's administration. */
+async function handleAuth(request: Request, env: Env): Promise<Response> {
+  if (request.method === "GET") {
+    return renderAuthGate();
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405 });
+  }
+
+  const form = await request.formData();
+  const passphrase = form.get("passphrase");
+  if (typeof passphrase !== "string" || !(await passphraseMatches(passphrase, env.MCP_API_KEY))) {
+    return renderAuthGate("Incorrect passphrase.");
+  }
+
+  const state = crypto.randomUUID();
+  await env.TOKEN_STORE.put(`oauth_state:${state}`, "1", { expirationTtl: 600 });
+
   const params = new URLSearchParams({
     client_id: env.EXACT_CLIENT_ID,
     redirect_uri: `${env.WORKER_URL}/callback`,
     response_type: "code",
     force_login: "0",
+    state,
   });
   return Response.redirect(`${env.EXACT_BASE_URL}/api/oauth2/auth?${params}`, 302);
 }
@@ -77,6 +116,15 @@ async function handleCallback(request: Request, env: Env): Promise<Response> {
   if (error || !code) {
     return new Response(`OAuth error: ${error ?? "missing code"}`, { status: 400 });
   }
+
+  const state = url.searchParams.get("state");
+  if (!state || !(await env.TOKEN_STORE.get(`oauth_state:${state}`))) {
+    return new Response(
+      "Invalid or expired state parameter. Start the connection flow again at /auth.",
+      { status: 403 },
+    );
+  }
+  await env.TOKEN_STORE.delete(`oauth_state:${state}`);
 
   try {
     const client = makeClient(env);

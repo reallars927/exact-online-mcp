@@ -26,10 +26,10 @@ You need a Cloudflare account (the free Workers tier suffices) and an Exact Onli
    npx wrangler secret put MCP_API_KEY   # a passphrase you choose; it gates connector access in step 6
    npx wrangler secret put WORKER_URL    # the deployed URL, e.g. https://exact-online-mcp.<account>.workers.dev
    ```
-5. **Connect Exact**: visit `https://<your-worker-url>/auth` in a browser and approve on Exact's consent screen. You should land on "Connected to Exact Online."
+5. **Connect Exact**: visit `https://<your-worker-url>/auth` in a browser, enter the `MCP_API_KEY` passphrase, and approve on Exact's consent screen. You should land on "Connected to Exact Online."
 6. **Add the connector**: in claude.ai → Settings → Connectors → Add custom connector, with URL `https://<your-worker-url>/mcp`. The OAuth flow opens the worker's authorize page; enter the `MCP_API_KEY` passphrase to approve.
 
-Anyone with the worker URL can *attempt* the connector flow, but without the passphrase they get no access to your data; the `/auth` Exact connection is tied to whichever Exact account approves the consent screen.
+Anyone with the worker URL can *attempt* the connector flow, but without the passphrase they get no access to your data. The `/auth` Exact connection flow is gated behind the same passphrase and bound to a single-use `state` nonce checked at `/callback`, so a third party can't complete the flow with their own Exact account and overwrite the stored tokens.
 
 ## Architecture
 
@@ -45,8 +45,8 @@ There are two separate OAuth flows: the worker is an OAuth *client* towards Exac
 
 **Worker ↔ Exact** (done once, by the owner):
 
-1. Visit `/auth` → redirects to Exact's OAuth consent screen.
-2. Exact redirects back to `/callback?code=...` → the worker exchanges the code for tokens, stores them in `TOKEN_STORE`, and caches the current division.
+1. Visit `/auth` → a passphrase form (the `MCP_API_KEY` secret). On success the worker stores a single-use `state` nonce (10-minute TTL) and redirects to Exact's OAuth consent screen with it.
+2. Exact redirects back to `/callback?code=...&state=...` → the worker rejects unknown/expired `state`, then exchanges the code for tokens, stores them in `TOKEN_STORE`, and caches the current division.
 3. Tokens are auto-refreshed on use, and a daily cron keep-alive stops the refresh token from hitting Exact's ~30-day disuse expiry.
 
 **MCP client ↔ worker** (e.g. adding the connector in claude.ai):
@@ -58,6 +58,10 @@ There are two separate OAuth flows: the worker is an OAuth *client* towards Exac
 ### Response shape
 
 All list tools return a **plain JSON array** of row objects — the OData envelope (`d.results`, `__next`, etc.) is unwrapped internally. Every list tool auto-paginates up to 20 pages to satisfy the requested `top`.
+
+### Rate limiting
+
+Exact allows 60 API requests/minute per app per administration. All API calls funnel through a client-side sliding-window throttle (50/min, leaving headroom) that also honors Exact's `X-RateLimit-*` response headers: an exhausted minutely budget blocks new requests until its reset, and a 429 is retried up to twice using `Retry-After`. When the *daily* budget is exhausted, requests fail immediately rather than retry — its reset is hours away. The throttle is per-isolate (like the token-refresh single-flight), which is the right scope for a single-tenant worker whose traffic comes from one agent session at a time.
 
 ## Tools
 

@@ -13,8 +13,25 @@ interface TrialBalanceLine {
   Amount: number | string;
 }
 
+/** Exact allows 60 requests/minute per app per administration; staying under it with
+ * headroom keeps bursts (pagination, per-line GUID lookups) from ever tripping the limit. */
+const MAX_REQUESTS_PER_MINUTE = 50;
+/** Longest a single request will stall on rate-limit waits before failing — bounded so
+ * MCP tool calls error out clearly instead of hanging into client timeouts. */
+const MAX_WAIT_MS = 30_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class ExactClient {
   private refreshPromise: Promise<string> | null = null;
+  /** Start timestamps of recent Exact API requests, ascending, pruned to the last minute. */
+  private recentRequests: number[] = [];
+  /** Set when Exact reports an exhausted minutely budget; no requests start before this. */
+  private blockedUntil = 0;
+  /** Serializes slot acquisition so concurrent calls queue instead of racing the window. */
+  private throttleChain: Promise<void> = Promise.resolve();
 
   constructor(
     private kv: KVNamespace,
@@ -23,6 +40,71 @@ export class ExactClient {
     private clientSecret: string,
     private workerUrl: string,
   ) {}
+
+  /** Sliding-window throttle: waits until starting a request keeps the last-minute count
+   * at or under MAX_REQUESTS_PER_MINUTE (and past any header-reported block). Per-isolate,
+   * like the token single-flight — makeClient in index.ts reuses one instance per isolate
+   * so concurrent requests in an isolate share this window. */
+  private async acquireSlot(): Promise<void> {
+    const prev = this.throttleChain;
+    let release!: () => void;
+    this.throttleChain = new Promise((resolve) => (release = resolve));
+    await prev;
+    try {
+      const now = Date.now();
+      let startAt = Math.max(now, this.blockedUntil);
+      this.recentRequests = this.recentRequests.filter((t) => t > startAt - 60_000);
+      if (this.recentRequests.length >= MAX_REQUESTS_PER_MINUTE) {
+        // Start once enough old requests age out of the minute window to make room.
+        const blocker = this.recentRequests[this.recentRequests.length - MAX_REQUESTS_PER_MINUTE];
+        startAt = Math.max(startAt, blocker + 60_000);
+      }
+      const wait = startAt - now;
+      if (wait > MAX_WAIT_MS) {
+        throw new Error("Exact Online rate limit reached; retry in about a minute.");
+      }
+      if (wait > 0) await sleep(wait);
+      this.recentRequests.push(Date.now());
+    } finally {
+      release();
+    }
+  }
+
+  /** Exact reports remaining budget via X-RateLimit-* headers on every response; when the
+   * minutely budget hits 0, block new requests until its reset instead of collecting 429s. */
+  private noteRateLimitHeaders(res: Response): void {
+    if (res.headers.get("X-RateLimit-Minutely-Remaining") === "0") {
+      const reset = Number(res.headers.get("X-RateLimit-Minutely-Reset")); // unix epoch ms
+      if (Number.isFinite(reset) && reset > this.blockedUntil) this.blockedUntil = reset;
+    }
+  }
+
+  /** How long to wait before retrying a 429, or null when retrying is pointless
+   * (daily budget exhausted — its reset is hours away, not seconds). */
+  private retryDelayMs(res: Response): number | null {
+    if (res.headers.get("X-RateLimit-Remaining") === "0") return null;
+    const retryAfter = Number(res.headers.get("Retry-After")); // seconds
+    if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1000, MAX_WAIT_MS);
+    const reset = Number(res.headers.get("X-RateLimit-Minutely-Reset"));
+    if (Number.isFinite(reset) && reset > Date.now()) return Math.min(reset - Date.now(), MAX_WAIT_MS);
+    return 5_000;
+  }
+
+  /** Every Exact API call funnels through here: throttle, then up to two 429 retries.
+   * Token-endpoint calls bypass it — Exact's token endpoint has its own "rate limit"
+   * semantics unrelated to the API budget (see refreshAccessToken). */
+  private async fetchExact(url: string, init?: RequestInit): Promise<Response> {
+    const maxAttempts = 3;
+    for (let attempt = 1; ; attempt++) {
+      await this.acquireSlot();
+      const res = await fetch(url, init);
+      this.noteRateLimitHeaders(res);
+      if (res.status !== 429 || attempt >= maxAttempts) return res;
+      const delay = this.retryDelayMs(res);
+      if (delay === null) return res;
+      await sleep(delay);
+    }
+  }
 
   private async getAccessToken(): Promise<string> {
     const stored = await this.kv.get<StoredTokens>("tokens", "json");
@@ -77,7 +159,7 @@ export class ExactClient {
 
   private async post<T>(path: string, body: unknown): Promise<T> {
     const token = await this.getAccessToken();
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.fetchExact(`${this.baseUrl}${path}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -91,7 +173,7 @@ export class ExactClient {
   /** PUT in Exact's OData API returns 204 No Content on success. */
   private async put(path: string, body: unknown): Promise<void> {
     const token = await this.getAccessToken();
-    const res = await fetch(`${this.baseUrl}${path}`, {
+    const res = await this.fetchExact(`${this.baseUrl}${path}`, {
       method: "PUT",
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -368,7 +450,7 @@ export class ExactClient {
     if (params) {
       for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     }
-    const res = await fetch(url.toString(), {
+    const res = await this.fetchExact(url.toString(), {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
     });
     if (!res.ok) {
@@ -393,7 +475,7 @@ export class ExactClient {
     const maxPages = 20;
 
     while (nextUrl && pages < maxPages && !(limit !== undefined && results.length >= limit)) {
-      const res = await fetch(nextUrl, {
+      const res = await this.fetchExact(nextUrl, {
         headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
       });
       if (!res.ok) {

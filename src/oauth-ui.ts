@@ -8,7 +8,7 @@ interface AuthorizeEnv {
 /** Constant-time passphrase check: comparing SHA-256 digests guarantees equal-length
  * inputs for `timingSafeEqual` (a Cloudflare Workers extension) and leaks neither
  * content nor length of the expected passphrase through timing. */
-async function passphraseMatches(passphrase: string, expected: string): Promise<boolean> {
+export async function passphraseMatches(passphrase: string, expected: string): Promise<boolean> {
   const enc = new TextEncoder();
   const [a, b] = await Promise.all([
     crypto.subtle.digest("SHA-256", enc.encode(passphrase)),
